@@ -1,14 +1,16 @@
 # ── Stage 1: Build React frontend ───────────────────────────────────────────
-FROM node:20-alpine AS frontend-builder
+FROM node:24-alpine AS frontend-builder
 
-ENV NODE_ENV=production
 WORKDIR /frontend
 
+# Install dependencies without NODE_ENV restriction to ensure devDependencies (Vite) resolve
 COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci --include=dev || npm install
+RUN npm ci || npm install
 
+# Build frontend and normalize output directory to guarantee COPY command succeeds
 COPY frontend/ .
-RUN npm run build
+RUN npm run build && \
+    if [ -d "build" ] && [ ! -d "dist" ]; then mv build dist; fi
 
 # ── Stage 2: Python runtime ─────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
@@ -34,8 +36,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Application source
 COPY app/ ./app/
 
-# Ingest compiled React assets (Standard React outputs to 'build', not 'dist')
-COPY --from=frontend-builder /frontend/build ./app/static/
+# Ingest compiled React assets from normalized 'dist' directory
+COPY --from=frontend-builder /frontend/dist ./app/static/
 
 # Security: Strict least privilege execution
 RUN groupadd -r appgroup && useradd -r -g appgroup -u 1001 appuser \
@@ -48,5 +50,5 @@ EXPOSE ${PORT}
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT}/health')" || exit 1
 
-# Execute using high-performance bindings (uvloop/httptools) present in your environment
+# Execute using high-performance bindings
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers 1 --loop uvloop --http httptools"]
