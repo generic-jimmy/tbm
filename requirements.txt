@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+asyncpg
+httpx
+python-jose
+cryptography
+pydantic-settings
+aiofiles
+openpyxl
+python-multipart
+telethon
