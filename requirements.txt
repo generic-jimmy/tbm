@@ -1,11 +1,24 @@
+# ── Core web framework ─────────────────────────────────────────────────────────
 fastapi
-uvicorn[standard]
-asyncpg
-httpx
-python-jose
-cryptography
+uvicorn[standard]         # [standard] pulls in websockets + httptools
+python-multipart          # needed for form/multipart (FastAPI dependency)
+
+# ── Data / validation ──────────────────────────────────────────────────────────
+pydantic
 pydantic-settings
-aiofiles
+
+# ── Database ───────────────────────────────────────────────────────────────────
+asyncpg
+
+# ── HTTP client ────────────────────────────────────────────────────────────────
+httpx
+
+# ── Auth / crypto ──────────────────────────────────────────────────────────────
+PyJWT                    # replaces python-jose (lighter, more active)
+cryptography            # Fernet token encryption
+
+# ── Telegram MTProto ───────────────────────────────────────────────────────────
+Telethon
+
+# ── Export ─────────────────────────────────────────────────────────────────────
 openpyxl
-python-multipart
-telethon
