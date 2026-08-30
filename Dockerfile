@@ -1,55 +1,60 @@
-# ── Stage 1: Build React frontend ───────────────────────────────────────────
-FROM node:24-alpine AS frontend-builder
-
+# ====================================
+# Stage 1: Build the Frontend
+# ====================================
+FROM node:24-alpine as frontend-builder
 WORKDIR /frontend
 
+# Copy package files first for better caching
 COPY frontend/package*.json ./
 RUN npm ci || npm install
 
+# Copy the rest of the frontend source code
 COPY frontend/ .
 
-# Execute build, forcefully map any known output directory to 'dist', 
-# and guarantee 'dist' exists at the OS level to prevent Docker build crashes.
+# Build the app, then smartly locate the output directory and force it into final_dist
 RUN npm run build && \
-    for dir in build out .next public; do \
-        if [ -d "$dir" ] && [ ! -d "dist" ]; then \
-            mv "$dir" dist; \
-            break; \
-        fi; \
-    done && \
-    mkdir -p dist
+    mkdir -p /frontend/final_dist && \
+    if [ -d "dist" ] && [ "$(ls -A dist)" ]; then \
+        cp -a dist/. /frontend/final_dist/; \
+    elif [ -d "build" ] && [ "$(ls -A build)" ]; then \
+        cp -a build/. /frontend/final_dist/; \
+    elif [ -d "out" ] && [ "$(ls -A out)" ]; then \
+        cp -a out/. /frontend/final_dist/; \
+    else \
+        echo "COULD NOT FIND BUILD OUTPUT! Printing files to Render logs:" && \
+        ls -la; \
+    fi
 
-# ── Stage 2: Python runtime ─────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PORT=8000
-
+# ====================================
+# Stage 2: Build the Python Backend
+# ====================================
+FROM python:3.12-slim
 WORKDIR /app
 
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq-dev \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+    libpq-dev gcc && \
+    rm -rf /var/lib/apt/lists/*
 
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     apt-get purge -y --auto-remove gcc
 
+# Copy the backend code
 COPY app/ ./app/
 
-# Ingest assets. The 'mkdir -p dist' in Stage 1 ensures this command never fatals.
-COPY --from=frontend-builder /frontend/dist ./app/static/
+# Copy the successfully built frontend directly into the Python static folder
+COPY --from=frontend-builder /frontend/final_dist/ ./app/static/
 
-RUN groupadd -r appgroup && useradd -r -g appgroup -u 1001 appuser \
-    && chown -R appuser:appgroup /app
-
+# Security: Run as non-root user
+RUN groupadd -r appgroup && useradd -r -g appgroup -u 1001 appuser && \
+    chown -R appuser:appgroup /app
 USER appuser
-EXPOSE ${PORT}
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT}/health')" || exit 1
+# Expose the API port
+EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers 1 --loop uvloop --http httptools"]
+# Start the server
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
