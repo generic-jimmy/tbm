@@ -125,7 +125,13 @@ class Database:
         self._pool: Optional[asyncpg.Pool] = None
 
     async def connect(self, dsn: str):
-        self._pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+        # statement_cache_size=0 fixes PgBouncer DuplicatePreparedStatementError
+        self._pool = await asyncpg.create_pool(
+            dsn, 
+            min_size=2, 
+            max_size=10,
+            statement_cache_size=0
+        )
         await self._init_schema()
         logger.info("Database pool ready")
 
