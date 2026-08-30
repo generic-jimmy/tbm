@@ -3,10 +3,11 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import get_settings
 from app.database import db
@@ -92,9 +93,22 @@ async def health():
     }
 
 
-# Serve React SPA — must be LAST
+# ==============================================================================
+# SPA MOUNT & ROUTING INTERCEPTOR
+# ==============================================================================
 _static = Path(__file__).parent / "static"
+
 if _static.exists():
+    @app.exception_handler(StarletteHTTPException)
+    async def spa_fallback_handler(request: Request, exc: StarletteHTTPException):
+        # Intercept 404s for frontend routes and serve index.html.
+        # Bypass SPA fallback for backend API routes (assuming /api prefix) or docs.
+        if exc.status_code == 404 and not request.url.path.startswith(("/api", "/docs")):
+            index_path = _static / "index.html"
+            if index_path.exists():
+                return FileResponse(str(index_path))
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
     app.mount("/", StaticFiles(directory=str(_static), html=True), name="spa")
 else:
     @app.get("/")
