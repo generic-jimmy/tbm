@@ -117,6 +117,27 @@ CREATE TABLE IF NOT EXISTS import_jobs (
     started_at  TIMESTAMPTZ DEFAULT NOW(),
     finished_at TIMESTAMPTZ
 );
+
+-- Per-chat MTProto import checkpoints — enables resumable full-history
+-- imports (earliest_id) and incremental re-sync (latest_id) without
+-- re-walking the whole chat every time.
+CREATE TABLE IF NOT EXISTS import_checkpoints (
+    bot_hash    TEXT NOT NULL,
+    chat_id     BIGINT NOT NULL,
+    earliest_id BIGINT,          -- oldest msg_id imported so far (resume point going back)
+    latest_id   BIGINT,          -- newest msg_id imported so far (resync point going forward)
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (bot_hash, chat_id)
+);
+
+-- Saved reply templates for Compose
+CREATE TABLE IF NOT EXISTS message_templates (
+    id           BIGSERIAL PRIMARY KEY,
+    name         TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    reply_markup JSONB,
+    created_at   TIMESTAMPTZ DEFAULT NOW()
+);
 """
 
 
@@ -125,7 +146,19 @@ class Database:
         self._pool: Optional[asyncpg.Pool] = None
 
     async def connect(self, dsn: str):
-        self._pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+        # statement_cache_size=0 is required for Supabase/Railway/Render-style
+        # managed Postgres, which sit behind a transaction-mode pooler
+        # (PgBouncer/Supavisor). That pool mode hands each query to a
+        # different backend connection, so asyncpg's server-side prepared
+        # statement cache goes stale mid-session and raises
+        # "prepared statement __asyncpg_stmt_N__ does not exist" under any
+        # real concurrency. Disabling the cache is the fix asyncpg's own
+        # error message documents, and it's safe on a direct (unpooled)
+        # connection too — it just forgoes a caching optimization we don't
+        # need at this app's query volume.
+        self._pool = await asyncpg.create_pool(
+            dsn, min_size=2, max_size=10, statement_cache_size=0
+        )
         await self._init_schema()
         logger.info("Database pool ready")
 
@@ -458,6 +491,59 @@ class Database:
             if r.get(f):
                 r[f] = r[f].isoformat()
         return r
+
+    # ── import checkpoints (resumable + incremental MTProto import) ────────────
+    async def get_checkpoint(self, bot_hash: str, chat_id: int) -> Optional[dict]:
+        return await self.fetchrow(
+            "SELECT * FROM import_checkpoints WHERE bot_hash=$1 AND chat_id=$2",
+            bot_hash, chat_id,
+        )
+
+    async def set_checkpoint(self, bot_hash: str, chat_id: int,
+                             earliest_id: Optional[int] = None,
+                             latest_id: Optional[int] = None):
+        await self.execute(
+            """
+            INSERT INTO import_checkpoints(bot_hash, chat_id, earliest_id, latest_id, updated_at)
+            VALUES ($1,$2,$3,$4,NOW())
+            ON CONFLICT(bot_hash, chat_id) DO UPDATE SET
+                earliest_id = COALESCE($3, import_checkpoints.earliest_id),
+                latest_id   = COALESCE($4, import_checkpoints.latest_id),
+                updated_at  = NOW()
+            """,
+            bot_hash, chat_id, earliest_id, latest_id,
+        )
+
+    # ── message templates ────────────────────────────────────────────────────
+    async def get_templates(self) -> list[dict]:
+        rows = await self.fetch(
+            "SELECT * FROM message_templates ORDER BY created_at DESC"
+        )
+        for r in rows:
+            if isinstance(r.get("reply_markup"), str):
+                r["reply_markup"] = json.loads(r["reply_markup"])
+            if r.get("created_at"):
+                r["created_at"] = r["created_at"].isoformat()
+        return rows
+
+    async def create_template(self, name: str, text: str,
+                              reply_markup: Optional[dict]) -> dict:
+        row = await self.fetchrow(
+            "INSERT INTO message_templates(name,text,reply_markup) "
+            "VALUES($1,$2,$3) RETURNING *",
+            name, text, json.dumps(reply_markup) if reply_markup else None,
+        )
+        d = dict(row)
+        if isinstance(d.get("reply_markup"), str):
+            d["reply_markup"] = json.loads(d["reply_markup"])
+        if d.get("created_at"):
+            d["created_at"] = d["created_at"].isoformat()
+        return d
+
+    async def delete_template(self, template_id: int):
+        await self.execute(
+            "DELETE FROM message_templates WHERE id=$1", template_id
+        )
 
     async def get_import_jobs(self, bot_hash: str) -> list[dict]:
         rows = await self.fetch(

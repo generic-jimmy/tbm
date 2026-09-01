@@ -51,3 +51,48 @@ def _extract_file_id(msg: dict) -> Optional[str]:
     if "photo" in msg:
         return msg["photo"][-1]["file_id"]
     return None
+
+
+# Telegram Bot API method + multipart field name, by our internal 'kind'.
+_UPLOAD_METHOD = {
+    "photo": ("sendPhoto", "photo"),
+    "video": ("sendVideo", "video"),
+    "audio": ("sendAudio", "audio"),
+    "voice": ("sendVoice", "voice"),
+}
+
+
+async def upload_media_to_storage(
+    client: httpx.AsyncClient,
+    token: str,
+    storage_chat_id: int,
+    data: bytes,
+    filename: str,
+    kind: str,
+) -> Optional[tuple[int, str]]:
+    """Upload raw media bytes (e.g. downloaded via Telethon) to the storage
+    group, returning (storage_msg_id, storage_file_id) — a real Bot-API
+    file_id, downloadable through the normal /api/files/{id}/download route.
+
+    Used by the MTProto importer's optional "download media" mode: Telethon's
+    internal file references aren't valid Bot API file_ids, so to make
+    imported media downloadable the same way as live-polled media, we pull
+    the bytes via MTProto once and re-upload them through the Bot API.
+    """
+    method, field = _UPLOAD_METHOD.get(kind, ("sendDocument", "document"))
+    try:
+        res = await client.post(
+            f"https://api.telegram.org/bot{token}/{method}",
+            data={"chat_id": storage_chat_id},
+            files={field: (filename, data)},
+            timeout=120.0,
+        )
+        d = res.json()
+        if not d.get("ok"):
+            logger.warning(f"Media re-upload failed: {d.get('description')}")
+            return None
+        result = d["result"]
+        return result["message_id"], _extract_file_id(result) or ""
+    except Exception as e:
+        logger.error(f"Media re-upload error: {e}")
+        return None

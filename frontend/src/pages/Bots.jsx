@@ -9,6 +9,8 @@ import { Plus, Trash2, Play, Square, RefreshCw, X,
 function ImportModal({ bot, onClose, toast }) {
   const [chatId,  setChatId]  = useState('')
   const [limit,   setLimit]   = useState('')
+  const [incremental, setIncremental] = useState(false)
+  const [downloadMedia, setDownloadMedia] = useState(false)
   const [busy,    setBusy]    = useState(false)
   const [jobId,   setJobId]   = useState(null)
   const [progress,setProgress]= useState(null)
@@ -32,7 +34,7 @@ function ImportModal({ bot, onClose, toast }) {
     e.preventDefault()
     setBusy(true)
     try {
-      const payload = { bot_hash: bot.token_hash }
+      const payload = { bot_hash: bot.token_hash, incremental, download_media: downloadMedia }
       if (chatId.trim()) payload.chat_ids = [Number(chatId)]
       if (limit.trim())  payload.limit    = Number(limit)
 
@@ -101,6 +103,28 @@ function ImportModal({ bot, onClose, toast }) {
                   placeholder="e.g. 5000"
                   type="number"
                 />
+
+                <div className="flex flex-col gap-2 bg-[#0d1425] border border-gray-800 rounded-lg p-3">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={incremental}
+                      onChange={e => setIncremental(e.target.checked)}
+                      className="accent-brand" />
+                    <span className="text-xs text-gray-300">
+                      Sync new messages only <span className="text-gray-600">(skip what's already imported — fast)</span>
+                    </span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={downloadMedia}
+                      onChange={e => setDownloadMedia(e.target.checked)}
+                      className="accent-brand" />
+                    <span className="text-xs text-gray-300">
+                      Download &amp; store media <span className="text-gray-600">(makes photos/files downloadable — slower, needs a storage group)</span>
+                    </span>
+                  </label>
+                  <p className="text-[11px] text-gray-600 pt-1">
+                    A stopped or crashed import always resumes automatically from where it left off — no need to check anything for that.
+                  </p>
+                </div>
 
                 {/* Live progress */}
                 {progress && (
@@ -276,7 +300,7 @@ function BotCard({ bot, onRefresh, toast }) {
   }
 
   const statusColor = {
-    polling:  'green', draining: 'amber',
+    polling:  'green', webhook: 'purple', draining: 'amber',
     starting: 'blue',  stopped:  'gray', error: 'red',
   }[bot.worker_status] || 'gray'
 

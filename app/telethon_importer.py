@@ -8,6 +8,26 @@ What this can access:
   ✔ All message types: text, media, documents, polls, etc.
   ✗ DMs between other users
   ✗ History from before the bot joined the chat (Telegram server enforces this)
+
+Resumability & incremental sync
+--------------------------------
+Every chat gets a checkpoint row in `import_checkpoints`:
+  - earliest_id: the oldest msg_id imported so far. A full-history import
+    always resumes from here automatically (via `offset_id`) instead of
+    restarting from scratch after a crash or a stopped job.
+  - latest_id: the newest msg_id imported so far. Incremental re-syncs
+    (manual "Sync new messages" or the scheduled background job) use this
+    as a `min_id` watermark to fetch only what's new.
+
+Media download (optional)
+--------------------------
+Telethon's internal file references are not valid Bot API file_ids, so
+imported media isn't downloadable through /api/files/.../download the way
+live-polled media is. When `download_media=True` and the bot has a storage
+group configured, each media message is pulled via MTProto and immediately
+re-uploaded through the Bot API to the storage group — after which it has
+a real file_id and behaves identically to live-forwarded media. This is
+opt-in because it multiplies bandwidth/time per message.
 """
 
 import asyncio
@@ -16,6 +36,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+import httpx
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl import types as tl
@@ -27,9 +48,12 @@ from telethon.errors import (
 from app.config import get_settings
 from app.crypto import decrypt_token
 from app.database import Database
+from app.storage import upload_media_to_storage
 from app.ws import ConnectionManager
 
 logger = logging.getLogger(__name__)
+
+DOWNLOADABLE_KINDS = {"photo", "document", "video", "audio", "voice"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,7 +85,6 @@ def _parse_telethon_msg(msg, bot_hash: str,
         if isinstance(media, tl.MessageMediaPhoto):
             kind = "photo"
             if hasattr(media, "photo") and media.photo:
-                # Telethon's photo sizes — pick largest
                 if hasattr(media.photo, "sizes") and media.photo.sizes:
                     biggest = max(
                         (s for s in media.photo.sizes
@@ -79,7 +102,6 @@ def _parse_telethon_msg(msg, bot_hash: str,
             mime  = getattr(doc, "mime_type", None)
             fsize = getattr(doc, "size",      None)
 
-            # Determine kind from attributes
             for attr in getattr(doc, "attributes", []):
                 if isinstance(attr, tl.DocumentAttributeVideo):
                     kind = "video"
@@ -98,7 +120,7 @@ def _parse_telethon_msg(msg, bot_hash: str,
                 elif isinstance(attr, tl.DocumentAttributeFilename):
                     fname = attr.file_name
 
-            if kind == "text":          # still unset → generic document
+            if kind == "text":
                 kind = "document"
             if kind == "document" and not body:
                 body = f"File: {fname or 'unknown'}  ({fsize or '?'} bytes)"
@@ -132,7 +154,7 @@ def _parse_telethon_msg(msg, bot_hash: str,
             body = f"Poll: {media.poll.question}"
 
         elif isinstance(media, tl.MessageMediaWebPage):
-            kind = "text"  # treat as text — body already has the text
+            kind = "text"
 
     if cap:
         body = (body + f"\n📝 {cap}").strip() if body else cap
@@ -193,10 +215,12 @@ class HistoryImporter:
 
     async def start(
         self,
-        bot_hash:    str,
-        chat_ids:    list[int] | None = None,
-        limit:       int | None       = None,
-        oldest_date: datetime | None  = None,
+        bot_hash:       str,
+        chat_ids:       list[int] | None = None,
+        limit:          int | None       = None,
+        oldest_date:    datetime | None  = None,
+        incremental:    bool             = False,
+        download_media: bool             = False,
     ) -> str:
         job_id = uuid.uuid4().hex[:10]
         self._live[job_id] = {
@@ -205,12 +229,13 @@ class HistoryImporter:
             "skipped":      0,
             "errors":       0,
             "current_chat": None,
+            "incremental":  incremental,
         }
-        # single chat_id or None (all known chats)
         db_chat_id = chat_ids[0] if chat_ids and len(chat_ids) == 1 else None
         await self._db.create_import_job(job_id, bot_hash, db_chat_id)
         asyncio.create_task(
-            self._run(job_id, bot_hash, chat_ids, limit, oldest_date),
+            self._run(job_id, bot_hash, chat_ids, limit, oldest_date,
+                      incremental, download_media),
             name=f"import-{job_id}",
         )
         return job_id
@@ -221,11 +246,13 @@ class HistoryImporter:
     # ── runner ────────────────────────────────────────────────────────────────
     async def _run(
         self,
-        job_id:      str,
-        bot_hash:    str,
-        chat_ids:    list[int] | None,
-        limit:       int | None,
-        oldest_date: datetime | None,
+        job_id:         str,
+        bot_hash:       str,
+        chat_ids:       list[int] | None,
+        limit:          int | None,
+        oldest_date:    datetime | None,
+        incremental:    bool,
+        download_media: bool,
     ):
         s   = get_settings()
         bot = await self._db.get_bot(bot_hash)
@@ -252,17 +279,20 @@ class HistoryImporter:
             s.telegram_api_hash,
         )
 
+        storage_id  = bot.get("storage_chat_id") if download_media else None
+        http_client: Optional[httpx.AsyncClient] = None
+        if storage_id:
+            http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
+
         try:
             await client.start(bot_token=token)
 
-            # Persist new session string so we don't re-auth on every import
             new_session = client.session.save()
             if new_session != session_str:
                 await self._db.update_telethon_session(bot_hash, new_session)
 
             await self._update(job_id, bot_hash, status="running")
 
-            # Resolve which chats to iterate
             if chat_ids:
                 targets = chat_ids
             else:
@@ -280,8 +310,9 @@ class HistoryImporter:
 
             for chat_id in targets:
                 imp, skip = await self._import_chat(
-                    client, job_id, bot_hash,
-                    chat_id, limit, oldest_date,
+                    client, http_client, token, storage_id,
+                    job_id, bot_hash, chat_id, limit, oldest_date,
+                    incremental,
                 )
                 total_imported += imp
                 total_skipped  += skip
@@ -302,15 +333,21 @@ class HistoryImporter:
             await self._fail(job_id, bot_hash, str(e))
         finally:
             await client.disconnect()
+            if http_client:
+                await http_client.aclose()
 
     async def _import_chat(
         self,
         client:      TelegramClient,
+        http_client: Optional[httpx.AsyncClient],
+        token:       str,
+        storage_id:  Optional[int],
         job_id:      str,
         bot_hash:    str,
         chat_id:     int,
         limit:       int | None,
         oldest_date: datetime | None,
+        incremental: bool,
     ) -> tuple[int, int]:
         try:
             entity = await client.get_entity(chat_id)
@@ -326,9 +363,11 @@ class HistoryImporter:
 
         await self._update(job_id, bot_hash,
             current_chat=f"{chat_title} ({chat_id})")
-        logger.info(f"[import-{job_id}] Importing '{chat_title}' ({chat_id})")
+        logger.info(
+            f"[import-{job_id}] {'Syncing' if incremental else 'Importing'} "
+            f"'{chat_title}' ({chat_id})"
+        )
 
-        # Build sender display-name cache for this chat
         sender_cache: dict[int, str] = {}
         try:
             async for p in client.iter_participants(entity, limit=500):
@@ -342,16 +381,31 @@ class HistoryImporter:
         except Exception:
             pass  # Some chat types don't allow iter_participants
 
+        # ── resolve resume point ─────────────────────────────────────────────
+        checkpoint = await self._db.get_checkpoint(bot_hash, chat_id)
+        earliest_seen = (checkpoint or {}).get("earliest_id")
+        latest_seen   = (checkpoint or {}).get("latest_id") or 0
+
+        iter_kwargs = dict(limit=limit, offset_date=oldest_date)
+        if incremental:
+            # Only fetch what's newer than the last message we've seen —
+            # oldest-first within that range so latest_seen advances cleanly.
+            iter_kwargs["min_id"]  = latest_seen
+            iter_kwargs["reverse"] = True
+        elif earliest_seen:
+            # Continue a previously interrupted/stopped full-history crawl
+            # instead of re-walking from the newest message every time.
+            iter_kwargs["offset_id"] = earliest_seen
+            logger.info(
+                f"[import-{job_id}] Resuming '{chat_title}' from "
+                f"msg_id {earliest_seen}"
+            )
+
         imported = 0
         skipped  = 0
 
         try:
-            async for msg in client.iter_messages(
-                entity,
-                limit=limit,
-                offset_date=oldest_date,  # None = go back as far as possible
-                reverse=False,            # newest → oldest (Telegram's natural order)
-            ):
+            async for msg in client.iter_messages(entity, **iter_kwargs):
                 row = _parse_telethon_msg(
                     msg, bot_hash, chat_id, chat_title, sender_cache
                 )
@@ -359,29 +413,42 @@ class HistoryImporter:
                     skipped += 1
                     continue
 
-                # Fast dedup check
                 exists = await self._db.message_exists(msg.id, chat_id, bot_hash)
                 if exists:
                     skipped += 1
-                    continue
-
-                ok = await self._db.insert_telethon_message(row)
-                if ok:
-                    imported += 1
                 else:
-                    skipped += 1
+                    if (http_client and storage_id
+                            and row["kind"] in DOWNLOADABLE_KINDS and msg.media):
+                        stored = await self._download_and_store(
+                            client, http_client, token, storage_id, msg, row,
+                        )
+                        if stored:
+                            row["tg_storage_msg_id"], row["tg_storage_file_id"] = stored
 
-                # Broadcast progress every 100 messages
-                if imported % 100 == 0 and imported > 0:
+                    ok = await self._db.insert_telethon_message(row)
+                    if ok:
+                        imported += 1
+                    else:
+                        skipped += 1
+
+                if earliest_seen is None or msg.id < earliest_seen:
+                    earliest_seen = msg.id
+                if msg.id > latest_seen:
+                    latest_seen = msg.id
+
+                if (imported + skipped) % 100 == 0:
+                    await self._db.set_checkpoint(
+                        bot_hash, chat_id,
+                        earliest_id=earliest_seen, latest_id=latest_seen,
+                    )
                     await self._update(job_id, bot_hash,
                         imported=self._live[job_id]["imported"] + imported,
                         skipped=self._live[job_id]["skipped"]  + skipped,
                         current_chat=f"{chat_title} ({chat_id})",
                     )
 
-                # Respect Telegram's rate limits
-                if imported % 500 == 0 and imported > 0:
-                    await asyncio.sleep(0.5)
+                if (imported + skipped) % 500 == 0:
+                    await asyncio.sleep(0.5)   # respect Telegram's rate limits
 
         except FloodWaitError as e:
             logger.warning(
@@ -390,7 +457,29 @@ class HistoryImporter:
         except RPCError as e:
             logger.warning(f"[import-{job_id}] RPC error in chat {chat_id}: {e}")
 
+        # Always persist the checkpoint reached so far, even on partial failure —
+        # this is what makes the next run resumable instead of starting over.
+        await self._db.set_checkpoint(
+            bot_hash, chat_id, earliest_id=earliest_seen, latest_id=latest_seen,
+        )
+
         return imported, skipped
+
+    async def _download_and_store(
+        self, client: TelegramClient, http_client: httpx.AsyncClient,
+        token: str, storage_id: int, msg, row: dict,
+    ) -> Optional[tuple[int, str]]:
+        try:
+            data = await client.download_media(msg, file=bytes)
+        except Exception as e:
+            logger.warning(f"Media download failed for msg {msg.id}: {e}")
+            return None
+        if not data:
+            return None
+        filename = row.get("file_name") or f"{row['kind']}_{msg.id}"
+        return await upload_media_to_storage(
+            http_client, token, storage_id, data, filename, row["kind"],
+        )
 
     # ── helpers ───────────────────────────────────────────────────────────────
     async def _update(self, job_id: str, bot_hash: str, **kwargs):
@@ -410,6 +499,3 @@ class HistoryImporter:
         await self._update(job_id, bot_hash, status="error", error=error,
                            finished_at=datetime.now(timezone.utc).isoformat())
         logger.error(f"[import-{job_id}] {error}")
-
-
-history_importer: HistoryImporter  # set in main.py

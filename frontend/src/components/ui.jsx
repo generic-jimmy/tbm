@@ -87,6 +87,7 @@ export function Badge({ children, color = 'blue' }) {
 export function StatusDot({ status }) {
   const map = {
     polling:  'bg-emerald-400 shadow-emerald-400/50',
+    webhook:  'bg-cyan-400 shadow-cyan-400/50',
     draining: 'bg-amber-400 shadow-amber-400/50',
     starting: 'bg-blue-400 shadow-blue-400/50',
     stopped:  'bg-gray-600',

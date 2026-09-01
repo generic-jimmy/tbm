@@ -1,7 +1,7 @@
 # ── Core web framework ─────────────────────────────────────────────────────────
 fastapi
-uvicorn[standard]         # [standard] pulls in websockets + httptools
-python-multipart          # needed for form/multipart (FastAPI dependency)
+uvicorn[standard]          # [standard] pulls in websockets + httptools
+python-multipart           # needed for form/multipart (FastAPI dependency)
 
 # ── Data / validation ──────────────────────────────────────────────────────────
 pydantic
@@ -14,7 +14,7 @@ asyncpg
 httpx
 
 # ── Auth / crypto ──────────────────────────────────────────────────────────────
-PyJWT                    # replaces python-jose (lighter, more active)
+PyJWT                     # replaces python-jose (lighter, more active)
 cryptography            # Fernet token encryption
 
 # ── Telegram MTProto ───────────────────────────────────────────────────────────

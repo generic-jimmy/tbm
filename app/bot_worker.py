@@ -1,18 +1,22 @@
-"""Single-bot async polling worker."""
+"""Single-bot worker — runs in either polling or webhook mode."""
 import asyncio
 import logging
 import httpx
-from datetime import datetime, timezone
 
 from app.parser import parse_update
 from app.storage import forward_to_storage
 from app.database import Database
 from app.ws import ConnectionManager
 from app.config import get_settings
+from app.webhook import webhook_secret_for, webhook_path
 
 logger = logging.getLogger(__name__)
 
 TG = "https://api.telegram.org/bot"
+
+ALLOWED_UPDATES = [
+    "message", "edited_message", "channel_post", "edited_channel_post",
+]
 
 
 class BotWorker:
@@ -29,6 +33,7 @@ class BotWorker:
         self.status     = "starting"
         self.error: str | None = None
         self._settings  = get_settings()
+        self.mode       = "webhook" if self._settings.webhook_base_url else "polling"
 
     async def run(self):
         self._set_status("starting")
@@ -36,17 +41,91 @@ class BotWorker:
             async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
                 if self._settings.history_drain_on_boot:
                     await self._drain_history(client)
-                self._set_status("polling")
-                while True:
-                    await self._poll_once(client)
-                    await asyncio.sleep(self._settings.poll_interval_seconds)
+
+                if self.mode == "webhook":
+                    await self._start_webhook_mode(client)
+                else:
+                    await self._start_polling_mode(client)
         except asyncio.CancelledError:
+            await self._teardown()
             self._set_status("stopped")
         except Exception as e:
             self._set_status("error", str(e))
             logger.error(f"[{self.bot_hash[:8]}] Worker crashed: {e}")
 
-    # ── history drain ─────────────────────────────────────────────────────────
+    # ── webhook mode ─────────────────────────────────────────────────────────
+    async def _start_webhook_mode(self, client: httpx.AsyncClient):
+        secret = webhook_secret_for(self.bot_hash, self._settings.secret_key)
+        url = self._settings.webhook_base_url.rstrip("/") + webhook_path(self.bot_hash)
+        res = await client.post(
+            f"{TG}{self.token}/setWebhook",
+            json={
+                "url": url,
+                "secret_token": secret,
+                "allowed_updates": ALLOWED_UPDATES,
+                "max_connections": 40,
+                "drop_pending_updates": False,
+            },
+        )
+        data = res.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"setWebhook failed: {data.get('description')}")
+
+        self._set_status("webhook")
+        logger.info(f"[{self.bot_hash[:8]}] Webhook registered → {url}")
+
+        # Updates now arrive via the FastAPI route (app.api.webhook), not this
+        # coroutine — just stay alive so BotManager sees the worker as running
+        # until it's cancelled (stop/restart/shutdown).
+        await asyncio.Event().wait()
+
+    async def handle_webhook_update(self, upd: dict):
+        """Entry point called by the /webhook/{bot_hash} route."""
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            await self._process_update(upd, client, broadcast=True)
+
+    # ── polling mode ─────────────────────────────────────────────────────────
+    async def _start_polling_mode(self, client: httpx.AsyncClient):
+        self._set_status("polling")
+        while True:
+            await self._poll_once(client)
+            await asyncio.sleep(self._settings.poll_interval_seconds)
+
+    async def _poll_once(self, client: httpx.AsyncClient):
+        try:
+            res = await client.get(
+                f"{TG}{self.token}/getUpdates",
+                params={"offset": self.last_uid, "timeout": 5},
+                timeout=12.0,
+            )
+            data = res.json()
+        except httpx.TimeoutException:
+            return
+        except Exception as e:
+            logger.warning(f"[{self.bot_hash[:8]}] Poll error: {e}")
+            return
+
+        if not data.get("ok"):
+            return
+
+        for upd in data["result"]:
+            self.last_uid = upd["update_id"] + 1
+            await self._process_update(upd, client, broadcast=True)
+
+        if data["result"]:
+            await self.db.update_last_poll_id(self.bot_hash, self.last_uid)
+
+    # ── teardown ──────────────────────────────────────────────────────────────
+    async def _teardown(self):
+        if self.mode == "webhook":
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as c:
+                    await c.post(f"{TG}{self.token}/deleteWebhook")
+                logger.info(f"[{self.bot_hash[:8]}] Webhook deregistered")
+            except Exception as e:
+                logger.warning(f"[{self.bot_hash[:8]}] deleteWebhook failed: {e}")
+
+    # ── history drain (runs once at startup, both modes) ────────────────────
     async def _drain_history(self, client: httpx.AsyncClient):
         self._set_status("draining")
         total = 0
@@ -93,39 +172,13 @@ class BotWorker:
             self.bot_hash,
         )
 
-    # ── live poll ─────────────────────────────────────────────────────────────
-    async def _poll_once(self, client: httpx.AsyncClient):
-        try:
-            res = await client.get(
-                f"{TG}{self.token}/getUpdates",
-                params={"offset": self.last_uid, "timeout": 5},
-                timeout=12.0,
-            )
-            data = res.json()
-        except httpx.TimeoutException:
-            return
-        except Exception as e:
-            logger.warning(f"[{self.bot_hash[:8]}] Poll error: {e}")
-            return
-
-        if not data.get("ok"):
-            return
-
-        for upd in data["result"]:
-            self.last_uid = upd["update_id"] + 1
-            await self._process_update(upd, client, broadcast=True)
-
-        if data["result"]:
-            await self.db.update_last_poll_id(self.bot_hash, self.last_uid)
-
-    # ── process one update ────────────────────────────────────────────────────
+    # ── process one update (shared by polling, webhook, and drain) ──────────
     async def _process_update(self, upd: dict, client: httpx.AsyncClient,
                               broadcast: bool = True):
         row = parse_update(upd, self.bot_hash)
         if not row:
             return
 
-        # Upsert chat + user in DB
         if row.get("_chat") and row.get("chat_id"):
             ch = row["_chat"]
             await self.db.upsert_chat(
@@ -136,14 +189,12 @@ class BotWorker:
         if row.get("_sender") and row.get("sender_id"):
             await self.db.upsert_user(row["_sender"], self.bot_hash)
 
-        # Strip internal keys before DB insert
         clean = {k: v for k, v in row.items() if not k.startswith("_")}
         inserted = await self.db.insert_message(clean)
 
         if not inserted:
             return
 
-        # Forward file to storage group (non-blocking)
         if (self._settings.auto_forward_files
                 and self.storage_id
                 and row.get("file_id")
@@ -154,7 +205,6 @@ class BotWorker:
             )
 
         if broadcast:
-            # Emit to WS clients
             ws_payload = {
                 "type":        "new_message",
                 "bot_hash":    self.bot_hash,
@@ -172,7 +222,6 @@ class BotWorker:
                                else str(clean["ts"]),
             }
             await self.ws.broadcast(ws_payload, self.bot_hash)
-            # Refresh stats for all clients
             await self.ws.send_all({"type": "stats_refresh"})
 
     async def _forward_file(self, client: httpx.AsyncClient,

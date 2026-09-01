@@ -27,6 +27,18 @@ class Settings(BaseSettings):
     history_drain_on_boot:    bool  = True
     poll_interval_seconds:    float = 0.8
 
+    # ── Webhook mode ────────────────────────────────────────────────────────
+    # If set, e.g. https://tbm.yourapp.com, bots register a Telegram webhook
+    # at {webhook_base_url}/webhook/{bot_hash} instead of long-polling.
+    # Leave empty to keep polling (default — works without a public HTTPS URL,
+    # e.g. local dev). Webhooks and polling are mutually exclusive per bot.
+    webhook_base_url: str = ""
+
+    # ── Scheduled MTProto re-sync ───────────────────────────────────────────
+    # Hours between automatic incremental re-syncs of every known chat for
+    # every active bot with MTProto configured. 0 disables it.
+    resync_interval_hours: float = 0
+
 
 @lru_cache
 def get_settings() -> Settings:

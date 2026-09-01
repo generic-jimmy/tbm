@@ -120,3 +120,24 @@ CREATE TABLE IF NOT EXISTS import_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_bot ON import_jobs(bot_hash);
+
+-- ── import_checkpoints ────────────────────────────────────────────────────
+-- Resumable full-history imports (earliest_id) + incremental re-sync (latest_id)
+CREATE TABLE IF NOT EXISTS import_checkpoints (
+    bot_hash    TEXT NOT NULL,
+    chat_id     BIGINT NOT NULL,
+    earliest_id BIGINT,
+    latest_id   BIGINT,
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (bot_hash, chat_id)
+);
+
+-- ── message_templates ─────────────────────────────────────────────────────
+-- Saved replies for Compose
+CREATE TABLE IF NOT EXISTS message_templates (
+    id           BIGSERIAL PRIMARY KEY,
+    name         TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    reply_markup JSONB,
+    created_at   TIMESTAMPTZ DEFAULT NOW()
+);

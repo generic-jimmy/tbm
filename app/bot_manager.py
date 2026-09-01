@@ -125,3 +125,12 @@ class BotManager:
     def is_running(self, bot_hash: str) -> bool:
         entry = self._registry.get(bot_hash)
         return bool(entry and not entry["task"].done())
+
+    def get_worker(self, bot_hash: str):
+        """Look up the live BotWorker instance for a running bot.
+
+        Used by the /webhook/{bot_hash} route to hand off an incoming
+        Telegram update to the correct worker's shared processing pipeline.
+        """
+        entry = self._registry.get(bot_hash)
+        return entry["worker"] if entry else None

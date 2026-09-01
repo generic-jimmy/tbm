@@ -4,10 +4,11 @@ export function getToken() { return localStorage.getItem('tbm_token') }
 
 async function request(path, opts = {}) {
   const token = getToken()
+  const isForm = opts.body instanceof FormData
   const res = await fetch(BASE + path, {
     ...opts,
     headers: {
-      'Content-Type': 'application/json',
+      ...(isForm ? {} : { 'Content-Type': 'application/json' }),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(opts.headers || {}),
     },
@@ -67,8 +68,20 @@ export const api = {
   chats: (hash) => request(`/api/chats?bot_hash=${hash}`),
 
   // ── send ───────────────────────────────────────────────────────────────────
+  // reply_markup, if passed, is { inline_keyboard: [[{text,url}], ...] } —
+  // URL buttons only (no callback_data handler wired up server-side yet).
   send: (payload) =>
     request('/api/send', { method: 'POST', body: JSON.stringify(payload) }),
+
+  sendMedia: (formData) =>
+    request('/api/send/media', { method: 'POST', body: formData }),
+
+  // ── templates ─────────────────────────────────────────────────────────────
+  templates:       ()               => request('/api/templates'),
+  createTemplate:  (payload)        =>
+    request('/api/templates', { method: 'POST', body: JSON.stringify(payload) }),
+  deleteTemplate:  (id)             =>
+    request(`/api/templates/${id}`, { method: 'DELETE' }),
 
   // ── files ──────────────────────────────────────────────────────────────────
   fileInfo: (hash, fid) => request(`/api/files/${fid}/info?bot_hash=${hash}`),
