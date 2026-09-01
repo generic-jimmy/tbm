@@ -321,7 +321,7 @@ class HistoryImporter:
                 status="done",
                 imported=total_imported,
                 skipped=total_skipped,
-                finished_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(timezone.utc),
             )
             logger.info(
                 f"[import-{job_id}] Done — "
@@ -485,17 +485,31 @@ class HistoryImporter:
     async def _update(self, job_id: str, bot_hash: str, **kwargs):
         if job_id in self._live:
             self._live[job_id].update(kwargs)
+
         db_kwargs = {k: v for k, v in kwargs.items()
                      if k in ("status","imported","skipped","current_chat",
                                "error","finished_at")}
         if db_kwargs:
+            # asyncpg requires a real datetime object for TIMESTAMPTZ columns —
+            # passing an ISO string here raises DataError. Keep finished_at as
+            # a datetime all the way to this call.
             await self._db.update_import_job(job_id, **db_kwargs)
+
+        # WebSocket.send_json() uses the stdlib json module with no datetime
+        # support (unlike FastAPI's HTTP responses, which auto-encode via
+        # jsonable_encoder) — stringify any datetime values just for this
+        # broadcast payload, not the DB write above.
+        def _jsonable(v):
+            return v.isoformat() if isinstance(v, datetime) else v
+
+        snapshot = {k: _jsonable(v) for k, v in self._live.get(job_id, {}).items()}
+        update   = {k: _jsonable(v) for k, v in kwargs.items()}
         await self._ws.broadcast(
-            {"type": "import_progress", "job_id": job_id, **self._live.get(job_id, {}), **kwargs},
+            {"type": "import_progress", "job_id": job_id, **snapshot, **update},
             bot_hash,
         )
 
     async def _fail(self, job_id: str, bot_hash: str, error: str):
         await self._update(job_id, bot_hash, status="error", error=error,
-                           finished_at=datetime.now(timezone.utc).isoformat())
+                           finished_at=datetime.now(timezone.utc))
         logger.error(f"[import-{job_id}] {error}")
